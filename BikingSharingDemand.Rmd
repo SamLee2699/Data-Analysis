@@ -1,0 +1,810 @@
+---
+title: "BikeSharing demand"
+author: "Sam Lee"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+Bike sharing systems generate strong daily and seasonal patterns that are closely tied to weather and commuting behaviour.
+
+The goal of this project is to predict hourly bike rental demand (count) and to understand which factors matter most for usage.
+
+Accurate forecasts can help operators plan fleet allocation, staff shifts, and maintenance more efficiently.
+
+I work with the Kaggle “Bike Sharing Demand” dataset (2011–2012), focusing on hourly demand, weather, and calendar effects.
+
+
+## Data
+
+The raw training data contain an hourly timestamp (datetime), categorical indicators for season, holiday, workingday, and weather, continuous weather variables including temp, atemp, humidity, and windspeed, and three demand variables: casual, registered, and their sum count, which is the target of interest.
+
+```{r}
+library(tidyverse)
+library(visdat)
+library(skimr)
+library(VIM)
+library(ggplot2)
+library(dplyr)
+library(recipes)
+library(readr)
+library(car)
+library(tidymodels)
+library(randomForest)
+library(Metrics)
+library(patchwork)
+train <- read_csv('/Users/sam/bikesharingdemand/data/train.csv')
+```
+
+season, holiday, working day, weather = factor.
+
+
+```{r}
+str(train)
+summary(train)
+```
+
+
+
+```{r}
+skim(train)
+vis_miss(train)
+```
+
+```{r}
+train <- train %>%
+  mutate(
+    year     = year(datetime),
+    month    = month(datetime),
+    day      = day(datetime),
+    hour     = hour(datetime),
+    wday_num = wday(datetime),
+    wday     = wday(datetime, label = TRUE),
+    log_count = log(count + 1)
+  )
+```
+
+
+```{r}
+train <- train %>%
+  mutate(
+    season      = factor(season,
+                         levels = c(1,2,3,4),
+                         labels = c("Winter","Spring","Summer","Fall")),
+    holiday     = factor(holiday, levels = c(0,1), labels=c("No","Yes")),
+    workingday  = factor(workingday, levels = c(0,1), labels=c("No","Yes")),
+    weather     = factor(weather, 
+                         levels = c(1,2,3,4),
+                         labels = c("Clear","Mist","Light Snow/Rain","Heavy Rain/Snow")),
+        year   = factor(year),
+    month  = factor(month, levels = 1:12, 
+                    labels = c("Jan","Feb","Mar","Apr","May","Jun",
+                               "Jul","Aug","Sep","Oct","Nov","Dec")),
+    day    = factor(day, levels = 1:31),
+    hour   = factor(hour, levels = 0:23),
+    wday_num = factor(wday_num, levels = 1:7,
+                      labels = c("Sun","Mon","Tue","Wed","Thu","Fri","Sat")),
+    wday = factor(wday, 
+                  levels = c("Sun","Mon","Tue","Wed","Thu","Fri","Sat"))
+  )
+str(train)
+
+```
+
+
+
+```{r}
+p1 <- ggplot(train, aes(count)) +
+  geom_histogram(bins = 40, fill="grey") +
+  labs(title="Distribution of count")
+
+p2 <- ggplot(train, aes(log_count)) +
+  geom_histogram(bins = 40, fill="grey") +
+  labs(title="Distribution of log(count+1)")
+
+gridExtra::grid.arrange(p1, p2, ncol=2)
+```
+
+
+```{r}
+library(MASS)
+
+bc <- boxcox(count ~ 1, data = train)
+lambda_opt <- bc$x[which.max(bc$y)]
+lambda_opt
+```
+
+
+
+```{r}
+lambda <- 0.3
+
+train$bc_count <- ((train$count + 1)^lambda - 1) / lambda
+
+ggplot(train, aes(bc_count)) +
+  geom_histogram(bins = 40, fill="grey") +
+  labs(title = "Box-Cox transformed count (lambda = 0.3)")
+```
+
+I started with converting categorical variables to factors and  original timestamp was decomposed into year, month, day, and hour in order to capture distinct temporal demand patterns at different time scales. Since the response variable count shows a severe right-skewed shape, I intially applied a log+1 transformation. To further stabilise variance and approximate normality, I applied Box-Cox transformation and the optimal lambda was approximately 0.3. After applying this transformation, the target distribution became substantially closer to a normal shape.
+
+
+## EDA plots
+
+```{r}
+# hourly demand
+train %>%
+  group_by(hour) %>%
+  summarise(mean_count = mean(count)) %>%
+  ggplot(aes(x = as.numeric(as.character(hour)), y = mean_count)) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous(breaks = 0:23) +
+  labs(title = "Average count by hour of day",
+       x = "hour")
+```
+
+
+
+Hourly demand exhibits a strong commuting pattern. The demand increases sharply between 6 and 8 AM, peaks during this period, and declines around 9 AM. The demand rises again from approximately 4 PM, reaching another peak at 5–6 PM before dropping rapidly after 7 PM. Although nighttime demand is relatively low, it is not negligible. Overall, the dominant demand is concentrated around commuting hours, with a noticeable secondary increase around midday.
+
+```{r}
+# wroking day and hour
+train %>%
+  group_by(workingday, hour) %>%
+  summarise(mean_count = mean(count), .groups="drop") %>%
+  ggplot(aes(x = as.numeric(as.character(hour)), y = mean_count, colour=workingday)) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous(breaks=0:23) +
+  labs(title="Hourly demand pattern by workingday")
+```
+
+When I separated working days from non-working days, distinct behavioral patterns emerged. On working days, demand is heavily concentrated around morning and evening commuting peaks. On weekends, demand increases steadily from the morning, remains high through the afternoon, and gradually declines in the late afternoon and evening. 
+
+
+```{r}
+# week day and hour
+train %>%
+  group_by(wday, hour) %>%
+  summarise(mean_count = mean(count), .groups="drop") %>%
+  ggplot(aes(x = as.numeric(as.character(hour)), y = mean_count, colour=wday)) +
+  geom_line() +
+  scale_x_continuous(breaks=0:23) +
+  labs(title="Hourly demand by day of week")
+```
+
+The day-of-week effects beyond the weekday–weekend distinction seem very weak. Monday through Friday follow nearly identical patterns, as do Saturday and Sunday. This suggests that a binary working-day indicator is sufficient, and detailed weekday dummies add only little explanatory value.
+
+
+```{r}
+# Seasons and count
+ggplot(train, aes(season, count, fill=season)) +
+  geom_boxplot() +
+  labs(title="Season vs Count")
+```
+
+Seasonal effects are also pronounced. Demand is lowest during winter and highest during summer, reflecting temperature-driven cycling behaviour. Because season and month share overlapping information, including both simultaneously in the model would introduce redundancy and multicollinearity. Therefore, one of them can be safely removed during modelling.
+
+```{r}
+# holiday and working day
+p_hol <- ggplot(train, aes(holiday, count, fill=holiday)) +
+  geom_boxplot() + labs(title="Holiday vs count")
+
+p_work <- ggplot(train, aes(workingday, count, fill=workingday)) +
+  geom_boxplot() + labs(title="Workingday vs count")
+
+gridExtra::grid.arrange(p_hol, p_work, ncol=2)
+```
+
+Holiday effects show an interesting contrast. Outside of holiday periods, overall demand tends to be higher. During holidays, weekday demand exceeds weekend demand, suggesting that commuting-related usage dominates even in holiday periods. While median demand levels do not differ dramatically, the interquartile range and upper quartiles show clear separation, indicating that high-demand events are more frequent on working days.
+
+
+
+
+```{r}
+# Weather impact
+ggplot(train, aes(weather, count, fill=weather)) +
+  geom_boxplot() +
+  labs(title="Weather vs count")
+```
+
+As expected, worsening weather conditions lead to a clear reduction in bike demand. Heavier rain or snow is associated with markedly lower demand.
+
+```{r}
+p1 <- ggplot(train, aes(casual)) +
+  geom_histogram(bins = 40, fill="skyblue") +
+  labs(title="Distribution of casual users")
+
+p2 <- ggplot(train, aes(registered)) +
+  geom_histogram(bins = 40, fill="orange") +
+  labs(title="Distribution of registered users")
+
+p1+p2
+```
+
+
+
+```{r}
+train %>%
+  group_by(hour) %>%
+  summarise(
+    casual_mean = mean(casual),
+    registered_mean = mean(registered)
+  ) %>%
+  pivot_longer(cols = c(casual_mean, registered_mean),
+               names_to = "type",
+               values_to = "mean_val") %>%
+  ggplot(aes(x = as.numeric(as.character(hour)), y = mean_val, color = type)) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous(breaks = 0:23) +
+  labs(title = "Hourly usage pattern: casual vs registered",
+       x = "hour", y = "mean count")
+```
+
+
+
+```{r}
+train %>%
+  group_by(workingday) %>%
+  summarise(
+    casual_mean = mean(casual),
+    registered_mean = mean(registered)
+  ) %>%
+  pivot_longer(cols = c(casual_mean, registered_mean),
+               names_to="type",
+               values_to="mean_val") %>%
+  ggplot(aes(x=workingday, y=mean_val, fill=type)) +
+  geom_col(position="dodge") +
+  labs(title="Casual vs Registered by Workingday")
+```
+
+```{r}
+train %>%
+  group_by(workingday, hour) %>%
+  summarise(
+    casual_mean = mean(casual),
+    registered_mean = mean(registered),
+    .groups="drop"
+  ) %>%
+  pivot_longer(cols = c(casual_mean, registered_mean),
+               names_to = "type",
+               values_to = "mean_val") %>%
+  ggplot(aes(
+    x = as.numeric(as.character(hour)),
+    y = mean_val,
+    color = type
+  )) +
+  geom_line(size = 1) +
+  facet_wrap(~ workingday, ncol = 1,
+             labeller = labeller(workingday = c("No" = "Weekend", "Yes" = "Weekday"))) +
+  scale_x_continuous(breaks = 0:23) +
+  labs(
+    title = "Hourly pattern for casual vs registered on weekend vs weekday",
+    x = "Hour",
+    y = "Mean count"
+  )
+```
+
+The majority of bike usage comes from registered users, whose behaviour largely determines the overall demand structure. Registered users primarily ride for commuting purposes, which explains the sharp weekday peaks. Even on weekends, registered users account for more trips than casual users. This suggests that individuals who regularly commute by bike also tend to ride recreationally on weekends. Casual users, in contrast, are almost absent on weekdays and mainly appear on weekends. I have checked that the total demand (count) is the sum of casual and registered. So these variables can be safely removed. Including these variables in predictive models would allow the model to reconstruct the target directly rather than learning meaningful relationships. Therefore, both variables were excluded from all models.
+
+
+
+```{r}
+#numerical variables 
+p_temp <- ggplot(train, aes(temp)) + geom_histogram(bins=40)
+p_atemp <- ggplot(train, aes(atemp)) + geom_histogram(bins=40)
+p_hum   <- ggplot(train, aes(humidity)) + geom_histogram(bins=40)
+p_wind  <- ggplot(train, aes(windspeed)) + geom_histogram(bins=40)
+
+gridExtra::grid.arrange(p_temp, p_atemp, p_hum, p_wind, ncol=2)
+```
+
+
+
+```{r}
+# corr matrix
+train %>%
+  dplyr::select(temp, atemp, humidity, windspeed, count) %>%
+  GGally::ggcorr(label = TRUE)
+```
+
+Temperature (temp) represents actual air temperature, while atemp reflects perceived feels-like temperature. Both variables show clear seasonality and several discrete peaks, likely due to rounded measurements. Their distributions are approximately normal and align well with real-world cycling behaviour. Demand is highest at moderate temperatures and decreases at extreme cold or heat. Because cycling exposes users directly to outdoor conditions, temperature is one of the strongest determinants of demand. As expected, temp and atemp are almost perfectly correlated. So, either can be used.
+
+Humidity displays a right-skewed distribution, and higher humidity generally suppresses demand, likely due to discomfort and its association with poor weather. 
+
+
+Windspeed shows an unusually large number of zero values. In reality, sustained zero windspeed is extremely rare, and the fact that zero is the modal value strongly suggests that unmeasured or missing observations were recorded as zero.
+
+For this reason, I will wtreat windspeed values equal to zero as missing values and will impute them using KNN imputation. 
+
+## KNN imputation for windspeed value = 0
+
+
+```{r}
+train_imp <- train %>%
+  mutate(windspeed = ifelse(windspeed == 0, NA, windspeed))
+
+imp_data <- train_imp %>%
+  mutate(
+    season_num   = as.numeric(season),
+    weather_num  = as.numeric(weather),
+    year_num     = as.numeric(year),
+    month_num    = as.numeric(month),
+    hour_num     = as.numeric(hour)
+  ) %>%
+  dplyr::select(
+    windspeed, temp, atemp, humidity,
+    season_num, weather_num, year_num, month_num, hour_num
+  )
+
+imp_result <- kNN(
+  imp_data,
+  variable = "windspeed",
+  k = 5,
+  imp_var = FALSE
+)
+
+train_imp$windspeed <- imp_result$windspeed
+```
+
+
+
+```{r}
+p_wind  <- ggplot(train, aes(windspeed)) + geom_histogram(bins=500, fill="red")+
+  labs(title="Before KNN Imputation (0 → NA)")
+
+p_new <- ggplot(train_imp, aes(windspeed)) +
+  geom_histogram(bins = 500, fill="blue") +
+  labs(title="After KNN Imputation")
+
+gridExtra::grid.arrange(p_wind, p_new, ncol=2)
+```
+After imputation, the artificial spike at zero disappears, producing a more realistic windspeed distribution and preventing distortion in downstream models.
+
+This correction would prevent distorted model behaviour, especially in linear and Poisson regression where extreme zeros can bias coefficient estimates, and in Random Forest models where such spikes degrade split purity. 
+
+
+```{r}
+year_summary <- train_imp %>%
+  group_by(year) %>%
+  summarise(
+    mean_count = mean(count),
+    sd_count   = sd(count),
+    n          = n(),
+    se_count   = sd_count / sqrt(n)
+  )
+
+p1<- ggplot(year_summary, aes(x = factor(year), y = mean_count)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = mean_count - se_count,
+                    ymax = mean_count + se_count),
+                width = 0.2) +
+  labs(title = "Average count by year", x = "year", y = "count")
+```
+
+
+```{r}
+month_summary <- train_imp %>%
+  group_by(month) %>%
+  summarise(
+    mean_count = mean(count),
+    sd_count   = sd(count),
+    n          = n(),
+    se_count   = sd_count / sqrt(n)
+  )
+
+p2<- ggplot(month_summary, aes(x = factor(month), y = mean_count)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = mean_count - se_count,
+                    ymax = mean_count + se_count),
+                width = 0.2) +
+  labs(title = "Average count by month", x = "month", y = "count")
+```
+
+
+```{r}
+year_month_summary <- train_imp %>%
+  mutate(
+    year_num  = as.integer(as.character(year)),   
+    month_num = as.integer(month), 
+    year_month = sprintf("%d-%02d", year_num, month_num)  
+  ) %>%
+  group_by(year_month) %>%
+  summarise(
+    mean_count = mean(count),
+    sd_count   = sd(count),
+    n          = n(),
+    se_count   = sd_count / sqrt(n),
+    .groups = "drop"
+  )
+
+p3<- ggplot(
+  year_month_summary,
+  aes(
+    x = factor(year_month, levels = sort(unique(year_month))),
+    y = mean_count
+  )
+) +
+  geom_col() +
+  geom_errorbar(
+    aes(
+      ymin = mean_count - se_count,
+      ymax = mean_count + se_count
+    ),
+    width = 0.2
+  ) +
+  labs(
+    title = "Average count by year-month",
+    x = "year_month",
+    y = "count"
+  ) +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1))
+```
+
+
+```{r}
+(p1+p2)/p3
+```
+
+
+Finally, examining demand by year and month revealed a clear increase in usage from 2011 to 2012, indicating system growth. Monthly patterns show strong seasonality. 
+
+
+```{r}
+day_summary <- train_imp %>%
+  group_by(day) %>%
+  summarise(
+    mean_count = mean(count),
+    sd_count   = sd(count),
+    n          = n(),
+    se_count   = sd_count / sqrt(n),
+    .groups = "drop"
+  )
+
+p4 <- ggplot(day_summary, aes(x = day, y = mean_count)) +
+  geom_col(fill = "grey40") +
+  geom_errorbar(
+    aes(ymin = mean_count - se_count,
+        ymax = mean_count + se_count),
+    width = 0.2
+  ) +
+  labs(
+    title = "Average count by day of month (1–31)",
+    x = "day",
+    y = "count"
+  ) +
+  theme_bw()
+
+p4
+```
+The day-of-month does not effectively explain demand. This variable was excluded from modelling.
+
+## Modelling
+
+```{r}
+set.seed(123)
+
+
+split <- initial_split(train_imp, prop = 0.75)
+train_set <- training(split)
+test_set  <- testing(split)
+
+train_set <- train_set %>%
+  mutate(
+    hour_bin = case_when(
+      hour %in% c(0,1,2,3,4,5)   ~ "late_night",
+      hour %in% c(6,7,8,9)       ~ "morning_peak",
+      hour %in% c(10,11,12,13)   ~ "midday",
+      hour %in% c(14,15,16)      ~ "afternoon",
+      hour %in% c(17,18,19)      ~ "evening_peak",
+      TRUE                       ~ "night"
+    ),
+    hour_bin = factor(hour_bin,
+        levels = c("late_night","morning_peak","midday",
+                   "afternoon","evening_peak","night"))
+  )
+
+test_set <- test_set %>%
+  mutate(
+    hour_bin = case_when(
+      hour %in% c(0,1,2,3,4,5)   ~ "late_night",
+      hour %in% c(6,7,8,9)       ~ "morning_peak",
+      hour %in% c(10,11,12,13)   ~ "midday",
+      hour %in% c(14,15,16)      ~ "afternoon",
+      hour %in% c(17,18,19)      ~ "evening_peak",
+      TRUE                       ~ "night"
+    ),
+    hour_bin = factor(hour_bin,
+        levels = c("late_night","morning_peak","midday",
+                   "afternoon","evening_peak","night"))
+  )
+```
+
+
+```{r}
+# Baseline Linear Regression with lambda 0.3
+bike_rec <- recipe(bc_count ~ ., data = train_set) %>%
+  step_rm(datetime, casual, registered, count, log_count, season,
+          day, hour, wday, wday_num) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%       
+  step_normalize(all_predictors())
+```
+
+
+```{r}
+bike_prep   <- prep(bike_rec)
+
+train_baked <- bake(bike_prep, new_data = NULL)      
+test_baked  <- bake(bike_prep, new_data = test_set)  
+```
+
+
+```{r}
+lm_bc <- lm(bc_count ~ ., data = train_baked)
+summary(lm_bc)
+```
+
+
+
+```{r}
+
+lm_step <- stats::step(lm_bc, direction = "both")
+summary(lm_step)
+```
+
+
+
+```{r}
+plot(lm_step)
+
+vif(lm_step)
+```
+
+
+```{r}
+lm_no_atemp <- lm(
+  bc_count ~ temp + humidity + windspeed + 
+    holiday_Yes + workingday_Yes + weather_Mist + 
+    year_X2012 + month_Feb + month_Mar + month_Apr + month_May + 
+    month_Jun + month_Jul + month_Aug + month_Sep + month_Oct + 
+    month_Nov + month_Dec + hour_bin_morning_peak + hour_bin_midday + 
+    hour_bin_afternoon + hour_bin_evening_peak + hour_bin_night, 
+    data = train_baked
+)
+
+
+lm_step_no_atemp <- stats::step(lm_no_atemp, direction = "both")
+summary(lm_step_no_atemp)
+```
+
+```{r}
+plot(lm_step_no_atemp)
+```
+
+
+```{r}
+inv_boxcox <- function(y_bc, lambda) {
+  ((y_bc * lambda) + 1)^(1 / lambda) - 1
+}
+
+pred_bc  <- predict(lm_step_no_atemp, newdata = test_baked)
+pred_cnt <- inv_boxcox(pred_bc, lambda)
+
+rmsle <- function(pred, actual) {
+  sqrt(mean((log(pred + 1) - log(actual + 1))^2))
+}
+
+rmsle_lm_bc <- rmsle(pred_cnt, test_set$count)
+rmsle_lm_bc
+```
+
+The first model fitted was a linear regression using the Box–Cox–transformed response (bc_count). To reduce multicollinearity and prevent overfitting due to excessive dummy variables, I grouped the 24-hour into six broader time bins representing distinct behavioural periods.
+
+The baseline linear model achieved an adjusted R^2 of approximately 0.73. However, diagnostic plots revealed clear heteroscedasticity. As fitted values increased, the variance of residuals also increased, violating the constant variance assumption. When evaluated using RMSLE—the competition metric for this Kaggle task, the linear model achieved a score of 0.728.
+
+
+```{r}
+# poisson model
+# prep
+rec_cnt <- recipe(count ~ ., data = train_set) %>%
+  step_rm(
+    datetime,     
+    casual, registered,  
+    log_count, bc_count, 
+    season, day, hour,        
+    wday, wday_num
+  ) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_predictors())
+
+prep_cnt <- prep(rec_cnt)
+
+train_baked_cnt <- bake(prep_cnt, new_data = NULL)
+test_baked_cnt  <- bake(prep_cnt, new_data = test_set)
+
+
+```
+
+```{r}
+# modelling
+pois_mod <- glm(
+  count ~ .,
+  data = train_baked_cnt,
+  family = poisson(link = "log")
+)
+
+summary(pois_mod)
+```
+
+```{r}
+overdisp <- sum(residuals(pois_mod, type = "pearson")^2) / pois_mod$df.residual
+overdisp 
+```
+
+```{r}
+nb_mod <- glm.nb(
+  count ~ .,
+  data = train_baked_cnt
+)
+
+summary(nb_mod)
+```
+
+Next, a Poisson regression model was fitted on the original count scale. A formal overdispersion test yielded a value close to 49, indicating that the variance far exceeded the mean and that the Poisson assumption was severely violated. As a result, a Negative Binomial (NB) model was fitted instead, with an estimated dispersion parameter theta ~= 2.43.
+
+
+```{r}
+plot(nb_mod)
+overdisp_nb <- sum(residuals(nb_mod, type="pearson")^2) / nb_mod$df.residual
+overdisp_nb
+```
+
+
+```{r}
+pred_nb <- predict(nb_mod, newdata = test_baked_cnt, type = "response")
+rmsle_nb <- rmsle(pred_nb, test_set$count)
+rmsle_nb
+```
+
+
+The NB model captured the overall structure of the data reasonably well, identifying the correct directional effects of weather, seasonality, and time. However, it continued to struggle with extreme high-demand periods, showing a heavy right-tail mismatch and mild heteroscedasticity. Although the NB model serves as a solid statistical baseline, its RMSLE of approximately 0.75 was worse than that of the linear model. This performance gap is likely due to the very high variance in peak demand hours. Even with an extra dispersion parameter, the NB model remains constrained by its parametric form and cannot flexibly adapt to sharp demand spikes.
+
+```{r}
+
+rf_rec <- recipe(count ~ temp + atemp + humidity + windspeed +
+                   holiday + workingday + weather +
+                   year + month + hour,
+                 data = train_imp) %>%
+  step_dummy(all_nominal_predictors())
+
+prep_rf <- prep(rf_rec)
+
+train_baked_rf <- bake(prep_rf, new_data = NULL)
+test_baked_rf  <- bake(prep_rf, new_data = test_set)
+
+# random forest
+
+
+set.seed(123)
+
+rf_basic <- randomForest(
+  count ~ .,
+  data      = train_baked_rf,
+  ntree     = 500,
+  mtry      = 3,
+  importance = TRUE
+)
+
+rf_basic
+
+pred_basic <- predict(rf_basic, newdata = test_baked_rf)
+rmsle_rf_basic <- rmsle(pred_basic, test_set$count)
+rmsle_rf_basic
+
+```
+0.94
+
+```{r}
+#tuning
+
+K <- 5
+fold_id <- sample(rep(1:K, length.out = nrow(train_baked_rf)))
+
+param_grid <- expand.grid(
+  mtry     = c(3, 5, 7, 9),
+  nodesize = c(5, 15, 30),
+  ntree    = c(300, 500, 800)
+)
+
+results <- param_grid
+results$cv_rmsle <- NA_real_
+
+#for (i in seq_len(nrow(param_grid))) {
+#  p <- param_grid[i, ]
+#  cv_scores <- numeric(K)
+#  
+#  for (k in 1:K) {
+#    train_fold <- train_baked_rf[fold_id != k, ]
+#    valid_fold <- train_baked_rf[fold_id == k, ]
+#    
+#    fit <- randomForest(
+#      count ~ .,
+#      data     = train_fold,
+#      ntree    = p$ntree,
+#      mtry     = p$mtry,
+#      nodesize = p$nodesize
+#    )
+    
+#    pred <- predict(fit, newdata = valid_fold)
+#    cv_scores[k] <- rmsle(pred, valid_fold$count)
+#  }
+  
+#  results$cv_rmsle[i] <- mean(cv_scores)
+#  cat("Done:", i, "of", nrow(param_grid),
+#      "| mtry =", p$mtry,
+#      "nodesize =", p$nodesize,
+#      "ntree =", p$ntree,
+#      "| CV RMSLE =", round(results$cv_rmsle[i], 4), "\n")
+#}
+
+#results <- results[order(results$cv_rmsle), ]
+#head(results, 5) 
+
+```
+
+
+```{r}
+
+best <- results[1, ]
+best
+
+rf_best <- randomForest(
+  count ~ .,
+  data     = train_baked_rf,
+  ntree    = 500,#best$ntree,
+  mtry     = 9,#best$mtry,
+  nodesize = 5,#best$nodesize,
+  importance = TRUE
+)
+
+pred_test <- predict(rf_best, newdata = test_baked_rf)
+rmsle_rf_best <- rmsle(pred_test, test_set$count)
+rmsle_rf_best
+
+```
+
+Finally, a Random Forest regression model was applied to model nonlinear relationships and complex interactions. The untuned baseline model achieved an R^2 of approximately 0.73 and an RMSLE of 0.94, indicating suboptimal default hyperparameters. After systematic tuning, the best-performing configuration was obtained with mtry = 9, nodesize = 5, and ntree = 500, yielding an RMSLE of 0.43. This substantial improvement confirms that demand is driven by highly nonlinear interactions between hour, months and year, and weather conditions, which are better captured by ensemble tree-based methods than by parametric models.
+
+
+```{r}
+varImpPlot(rf_best)
+```
+
+Vairable importance was evaluated using the mean decrease in prediction error across trees, reflecting how much each variable contributes to reducing overall forecasting error.
+
+The most influential predictor by a large margin is hour of day. This confirms that hourly demand is fundamentally structured by daily human activity cycles. In particular, commuting behavior during morning and evening peak hours dominates overall usage patterns. The model relies heavily on this variable to separate low-demand nighttime periods from high-demand commuting periods, making hour the single most critical feature.
+
+The year variable also shows high importance since the demand drastically grew from the period of 2011 to 2012. 
+
+Workingday, Month, temperature, humidity and wind are other important factors.
+
+Overall, the variable importance results reinforce a clear hierarchy. Time-driven behavioral patterns dominate bike-sharing demand, while weather conditions act as modifiers on top of this temporal backbone. This explains why Random Forest, which naturally captures interactions between time and weather, substantially outperforms linear and count-based models.
+ 
+ 
+## Conclusion
+
+
+In this project, I examined hourly bike-sharing demand by combining detailed exploratory analysis with a range of statistical models: Linear, Poisson, Negative Binomial and an ensenble model, Random Forest. The analysis confirms that demand is primarily governed by strong temporal structure, which are hour of day, workingday status, and long-term calendar effects define the fundamental shape of usage. Weather conditions such as temperature, humidity, and windspeed consistently influence demand, but they act mainly as modifiers rather than core drivers.
+
+From a modelling perspective, linear regression with a Box–Cox transformation provides a strong and interpretable baseline, capturing the main directional effects of weather and seasonality. Negative Binomial regression improves upon the Poisson model by addressing overdispersion, but remains limited by its parametric form and struggles with extreme peak-demand periods. In contrast, the tuned Random Forest model substantially outperforms all parametric approaches, achieving the lowest RMSLE by effectively learning nonlinear interactions and sharp demand spikes associated with commuting behavior.
+
+Overall, the results suggest that accurate demand forecasting requires models that can accommodate both strong periodic structure and context-dependent nonlinear effects. For operational use, the tuned Random Forest provides a reliable forecasting tool, while simpler parametric models remain valuable for interpretation and understanding underlying demand drivers.
